@@ -14,7 +14,7 @@ This fork is highly optimized for memory efficiency, using buffer pooling and ti
 Module-aware mode:
 
 ```bash
-go get github.com/Morditux/mc/v3
+go get github.com/Morditux/mc
 ```
 
 Legacy GOPATH mode:
@@ -26,7 +26,7 @@ go get github.com/Morditux/mc
 ## Use
 
 ```go
-import "github.com/Morditux/mc/v3"
+import "github.com/Morditux/mc"
 
 func main() {
   // Error handling omitted for demo
