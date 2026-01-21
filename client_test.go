@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	mcAddr  = "localhost:11289"
-	badAddr = "127.0.0.2:23111"
-	user    = "user-1"
-	pass    = "pass"
+	user    = ""
+	pass    = ""
+	mcAddr  = "localhost:11211"
+	badAddr = "localhost:11212"
 )
 
 var mcNil error

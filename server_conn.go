@@ -3,7 +3,7 @@ package mc
 // Handles the connection with the memcached servers.
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -30,9 +30,10 @@ type serverConn struct {
 	password  string
 	config    *Config
 	conn      net.Conn
-	buf       *bytes.Buffer
+	rw        *bufio.ReadWriter
 	opq       uint32
 	backupMsg msg
+	hdrBuf    [24]byte // pre-allocated buffer for headers
 }
 
 func newServerConn(address, scheme, username, password string, config *Config) mcConn {
@@ -42,7 +43,6 @@ func newServerConn(address, scheme, username, password string, config *Config) m
 		username: username,
 		password: password,
 		config:   config,
-		buf:      new(bytes.Buffer),
 	}
 	return serverConn
 }
@@ -76,6 +76,7 @@ func (sc *serverConn) quit(m *msg) {
 		if sc.conn != nil {
 			sc.conn.Close()
 			sc.conn = nil
+			sc.rw = nil
 		}
 	}
 }
@@ -96,6 +97,9 @@ func (sc *serverConn) connect() error {
 		tcpConn.SetKeepAlivePeriod(sc.config.TcpKeepAlivePeriod)
 		tcpConn.SetNoDelay(sc.config.TcpNoDelay)
 	}
+
+	sc.rw = bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c))
+
 	// authenticate
 	err = sc.auth()
 	if err != nil {
@@ -105,6 +109,7 @@ func (sc *serverConn) connect() error {
 			if sc.conn != nil {
 				sc.conn.Close()
 				sc.conn = nil
+				sc.rw = nil
 			}
 			return err
 		}
@@ -205,33 +210,62 @@ func (sc *serverConn) send(m *msg) error {
 	m.Opaque = sc.opq
 	sc.opq++
 
-	// Request
-	err := binary.Write(sc.buf, binary.BigEndian, m.header)
-	if err != nil {
+	// Header
+	sc.hdrBuf[0] = uint8(m.Magic)
+	sc.hdrBuf[1] = uint8(m.Op)
+	binary.BigEndian.PutUint16(sc.hdrBuf[2:], m.KeyLen)
+	sc.hdrBuf[4] = m.ExtraLen
+	sc.hdrBuf[5] = m.DataType
+	binary.BigEndian.PutUint16(sc.hdrBuf[6:], m.ResvOrStatus)
+	binary.BigEndian.PutUint32(sc.hdrBuf[8:], m.BodyLen)
+	binary.BigEndian.PutUint32(sc.hdrBuf[12:], m.Opaque)
+	binary.BigEndian.PutUint64(sc.hdrBuf[16:], m.CAS)
+
+	// Make sure write does not block forever
+	sc.conn.SetWriteDeadline(time.Now().Add(sc.config.ConnectionTimeout))
+
+	if _, err := sc.rw.Write(sc.hdrBuf[:]); err != nil {
 		return wrapError(StatusNetworkError, err)
 	}
 
 	for _, e := range m.iextras {
-		err = binary.Write(sc.buf, binary.BigEndian, e)
+		var err error
+		switch v := e.(type) {
+		case uint8:
+			err = sc.rw.WriteByte(v)
+		case uint16:
+			var b [2]byte
+			binary.BigEndian.PutUint16(b[:], v)
+			_, err = sc.rw.Write(b[:])
+		case uint32:
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], v)
+			_, err = sc.rw.Write(b[:])
+		case uint64:
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], v)
+			_, err = sc.rw.Write(b[:])
+		default:
+			panic(fmt.Sprintf("mc: unknown extra type (%T)", e))
+		}
 		if err != nil {
 			return wrapError(StatusNetworkError, err)
 		}
 	}
 
-	_, err = io.WriteString(sc.buf, m.key)
-	if err != nil {
-		return wrapError(StatusNetworkError, err)
+	if len(m.key) > 0 {
+		if _, err := io.WriteString(sc.rw, m.key); err != nil {
+			return wrapError(StatusNetworkError, err)
+		}
 	}
 
-	_, err = io.WriteString(sc.buf, m.val)
-	if err != nil {
-		return wrapError(StatusNetworkError, err)
+	if len(m.val) > 0 {
+		if _, err := io.WriteString(sc.rw, m.val); err != nil {
+			return wrapError(StatusNetworkError, err)
+		}
 	}
 
-	// Make sure write does not block forever
-	sc.conn.SetWriteDeadline(time.Now().Add(sc.config.ConnectionTimeout))
-	_, err = sc.buf.WriteTo(sc.conn)
-	if err != nil {
+	if err := sc.rw.Flush(); err != nil {
 		return wrapError(StatusNetworkError, err)
 	}
 
@@ -244,31 +278,88 @@ func (sc *serverConn) recv(m *msg) error {
 	// Make sure read does not block forever
 	sc.conn.SetReadDeadline(time.Now().Add(sc.config.ConnectionTimeout))
 
-	err := binary.Read(sc.conn, binary.BigEndian, &m.header)
-	if err != nil {
+	// Read Header
+	if _, err := io.ReadFull(sc.rw, sc.hdrBuf[:]); err != nil {
 		return wrapError(StatusNetworkError, err)
 	}
 
-	bd := make([]byte, m.BodyLen)
-	_, err = io.ReadFull(sc.conn, bd)
-	if err != nil {
+	// Parse Header
+	m.header.Magic = magicCode(sc.hdrBuf[0])
+	m.header.Op = opCode(sc.hdrBuf[1])
+	m.header.KeyLen = binary.BigEndian.Uint16(sc.hdrBuf[2:])
+	m.header.ExtraLen = sc.hdrBuf[4]
+	m.header.DataType = sc.hdrBuf[5]
+	m.header.ResvOrStatus = binary.BigEndian.Uint16(sc.hdrBuf[6:])
+	m.header.BodyLen = binary.BigEndian.Uint32(sc.hdrBuf[8:])
+	m.header.Opaque = binary.BigEndian.Uint32(sc.hdrBuf[12:])
+	m.header.CAS = binary.BigEndian.Uint64(sc.hdrBuf[16:])
+
+	// Read Body
+	// We allocation a new buffer for the body to avoid reading into a shared one
+	// and then copying again to string.
+	// Optimization: If BodyLen is small, maybe we can use stack, but Body can be large.
+	// For now, simple allocation is safer than complex pooling logic for variable sizes.
+	body := make([]byte, m.BodyLen)
+	if _, err := io.ReadFull(sc.rw, body); err != nil {
 		return wrapError(StatusNetworkError, err)
 	}
 
-	buf := bytes.NewBuffer(bd)
+	buf := body // alias for slicing
 
+	// Read Extras
 	if m.ResvOrStatus == 0 && m.ExtraLen > 0 {
+		if len(buf) < int(m.ExtraLen) {
+			return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+		}
+		extrasBuf := buf[:m.ExtraLen]
+		buf = buf[m.ExtraLen:]
+
+		offset := 0
 		for _, e := range m.oextras {
-			err := binary.Read(buf, binary.BigEndian, e)
-			if err != nil {
-				return wrapError(StatusNetworkError, err)
+			switch ptr := e.(type) {
+			case *uint8:
+				if offset+1 > len(extrasBuf) {
+					return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+				}
+				*ptr = extrasBuf[offset]
+				offset += 1
+			case *uint16:
+				if offset+2 > len(extrasBuf) {
+					return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+				}
+				*ptr = binary.BigEndian.Uint16(extrasBuf[offset:])
+				offset += 2
+			case *uint32:
+				if offset+4 > len(extrasBuf) {
+					return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+				}
+				*ptr = binary.BigEndian.Uint32(extrasBuf[offset:])
+				offset += 4
+			case *uint64:
+				if offset+8 > len(extrasBuf) {
+					return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+				}
+				*ptr = binary.BigEndian.Uint64(extrasBuf[offset:])
+				offset += 8
+			default:
+				// Fallback to binary.Read if we missed something, though likely unneeded
+				// But we are reading from slice now, not reader.
+				// For now assuming we covered standard extras.
+				return wrapError(StatusNetworkError, fmt.Errorf("mc: unknown extra type in response %T", e))
 			}
 		}
 	}
 
-	m.key = string(buf.Next(int(m.KeyLen)))
-	vlen := int(m.BodyLen) - int(m.ExtraLen) - int(m.KeyLen)
-	m.val = string(buf.Next(int(vlen)))
+	// Read Key
+	if len(buf) < int(m.KeyLen) {
+		return wrapError(StatusNetworkError, io.ErrUnexpectedEOF)
+	}
+	m.key = string(buf[:m.KeyLen])
+	buf = buf[m.KeyLen:]
+
+	// Read Value (remaining)
+	m.val = string(buf)
+
 	return newError(m.ResvOrStatus)
 }
 
@@ -276,16 +367,16 @@ func (sc *serverConn) recv(m *msg) error {
 func sizeOfExtras(extras []interface{}) (l uint8) {
 	for _, e := range extras {
 		switch e.(type) {
+		case uint8:
+			l += 1
+		case uint16:
+			l += 2
+		case uint32:
+			l += 4
+		case uint64:
+			l += 8
 		default:
 			panic(fmt.Sprintf("mc: unknown extra type (%T)", e))
-		case uint8:
-			l += 8 / 8
-		case uint16:
-			l += 16 / 8
-		case uint32:
-			l += 32 / 8
-		case uint64:
-			l += 64 / 8
 		}
 	}
 	return
@@ -295,8 +386,11 @@ func sizeOfExtras(extras []interface{}) (l uint8) {
 // reconnect on next usage.
 func (sc *serverConn) resetConn(err error) {
 	if err.(*Error).Status == StatusNetworkError {
-		sc.conn.Close()
-		sc.conn = nil
+		if sc.conn != nil {
+			sc.conn.Close()
+			sc.conn = nil
+			sc.rw = nil
+		}
 	}
 }
 
