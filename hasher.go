@@ -5,6 +5,7 @@ package mc
 import (
 	"hash"
 	"hash/fnv"
+	"io"
 )
 
 type hasher interface {
@@ -31,7 +32,8 @@ func (h *moduloHasher) getServerIndex(key string) (uint, error) {
 		return 0, &Error{StatusNetworkError, "No server available", nil}
 	}
 
-	h.h32.Write([]byte(key))
+	// Use io.WriteString to avoid []byte(key) allocation
+	io.WriteString(h.h32, key)
 	defer h.h32.Reset()
 
 	return uint(h.h32.Sum32()) % h.nServers, nil

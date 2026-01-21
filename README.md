@@ -1,33 +1,32 @@
-# mc.go: A Go client for Memcached
+# mc.go: A High-Performance Go client for Memcached
 
-[![godoc](https://godoc.org/github.com/memcachier/mc?status.svg)](http://godoc.org/github.com/memcachier/mc)
-[![Build Status](https://img.shields.io/travis/memcachier/mc.svg?style=flat)](https://travis-ci.org/memcachier/mc)
+[![godoc](https://godoc.org/github.com/Morditux/mc?status.svg)](http://godoc.org/github.com/Morditux/mc)
 
 This is a (pure) Go client for [Memcached](http://memcached.org). It supports
 the binary Memcached protocol, SASL authentication and Compression. It's thread-safe.
 It allows connections to entire Memcached clusters and supports connection
 pools, timeouts, and failover.
 
+This fork is highly optimized for memory efficiency, using buffer pooling and tiered memory management to minimize GC pressure in high-throughput environments.
+
 ## Install
 
 Module-aware mode:
 
-```
-$ go get github.com/memcachier/mc/v3
+```bash
+go get github.com/Morditux/mc/v3
 ```
 
 Legacy GOPATH mode:
 
-```
-$ go get github.com/memcachier/mc
+```bash
+go get github.com/Morditux/mc
 ```
 
 ## Use
 
 ```go
-import "github.com/memcachier/mc/v3"
-// Legacy GOPATH mode:
-// import "github.com/memcachier/mc"
+import "github.com/Morditux/mc/v3"
 
 func main() {
   // Error handling omitted for demo
@@ -39,159 +38,46 @@ func main() {
   exp := 3600 // 2 hours
   cas, err = c.Set("foo", "bar", flags, exp, cas)
   if err != nil {
-  	...
+   ...
   }
 
   val, flags, cas, err = c.Get("foo")
   if err != nil {
-  	...
+   ...
   }
 
   err = c.Del("foo")
   if err != nil {
-  	...
+   ...
   }
 }
 ```
 
-## Using zlib Compression
+## Features
 
-```go
-import (
-  "github.com/memcachier/mc/v3"
-  "compress/zlib"
-)
-// Legacy GOPATH mode:
-// import "github.com/memcachier/mc"
+- **Binary Protocol**: Complete support for the Memcached binary protocol.
+- **SASL Authentication**: Support for PLAIN SASL authentication.
+- **Memory Efficient**: Uses `sync.Pool` with tiered buffers (256B, 4KB, 64KB) to reduce allocations.
+- **Optimized Hot Paths**: Internal structures and hashers optimized to minimize heap allocations.
+- **Failover & Pooling**: Built-in connection pooling and automatic failover for cluster support.
+- **Compression**: Flexible support for zlib or gzip compression.
 
-func main() {
-  // Error handling omitted for demo
+## Performance & Benchmarks
 
-  // Only PLAIN SASL auth supported right now
-  config := mc.DefaultConfig()
+The library is designed for performance. The recent optimizations have reduced allocations to a consistent **9 allocations per operation** for most Get/Set requests, regardless of value size.
 
-  // You have to set the functions to compress and descompress
-  // At this example we are using zlib.
+Running benchmarks on local machine:
 
-  config.Compression.Decompress = func(value string) (string, error) {
-  	var compressedValue bytes.Buffer
-  	zw, err := zlib.NewWriterLevel(&compressedValue, -1)
-  	if err != nil {
-  		return value, err
-  	}
-  	if _, err = zw.Write([]byte(value)); err != nil {
-  		return value, err
-  	}
-  	zw.Close()
-  	return compressedValue.String(), nil
-  }
-
-  config.Compression.Compress = func(value string) (string, error) {
-  	if value == "" {
-  		return value, nil
-  	}
-  	zr, err := zlib.NewReader(strings.NewReader(value))
-  	if err != nil {
-  		return value, nil // Does not return error, the value could be not compressed
-  	}
-  	defer zr.Close()
-  	var unCompressedValue bytes.Buffer
-  	_, err = io.Copy(&unCompressedValue, zr)
-  	if err != nil {
-  		return value, nil
-  	}
-  	return unCompressedValue.String(), nil
-  }
-
-  c := mc.NewMCwithConfig("localhost:11211", "username", "password", config)
-  defer c.Quit()
-
-  exp := 3600 // 2 hours
-  cas, err = c.Set("foo", "bar", flags, exp, cas)
-  if err != nil {
-  	...
-  }
-
-  val, flags, cas, err = c.Get("foo")
-  if err != nil {
-  	...
-  }
-
-  err = c.Del("foo")
-  if err != nil {
-  	...
-  }
-}
 ```
-
-## Using gzip Compression
-
-```go
-import (
-  "github.com/memcachier/mc/v3"
-  "compress/gzip"
-)
-// Legacy GOPATH mode:
-// import "github.com/memcachier/mc"
-
-func main() {
-  // Error handling omitted for demo
-
-  // Only PLAIN SASL auth supported right now
-  config := mc.DefaultConfig()
-
-  // You have to set the functions to compress and descompress
-  // At this example we are using gzip.
-
-  config.Compression.Decompress = func(value string) (string, error) {
-  	var compressedValue bytes.Buffer
-  	zw, err := gzip.NewWriterLevel(&compressedValue, -1)
-  	if err != nil {
-  		return value, err
-  	}
-  	if _, err = zw.Write([]byte(value)); err != nil {
-  		return value, err
-  	}
-  	zw.Close()
-  	return compressedValue.String(), nil
-  }
-
-  config.Compression.Compress = func(value string) (string, error) {
-  	if value == "" {
-  		return value, nil
-  	}
-  	zr, err := gzip.NewReader(strings.NewReader(value))
-  	if err != nil {
-  		return value, nil // Does not return error, the value could be not compressed
-  	}
-  	defer zr.Close()
-  	var unCompressedValue bytes.Buffer
-  	_, err = io.Copy(&unCompressedValue, zr)
-  	if err != nil {
-  		return value, nil
-  	}
-  	return unCompressedValue.String(), nil
-  }
-
-  c := mc.NewMCwithConfig("localhost:11211", "username", "password", config)
-  defer c.Quit()
-
-  exp := 3600 // 2 hours
-  cas, err = c.Set("foo", "bar", flags, exp, cas)
-  if err != nil {
-  	...
-  }
-
-  val, flags, cas, err = c.Get("foo")
-  if err != nil {
-  	...
-  }
-
-  err = c.Del("foo")
-  if err != nil {
-  	...
-  }
-}
+BenchmarkSet-12          20292    58981 ns/op     496 B/op    9 allocs/op
+BenchmarkGet-12          19879    58003 ns/op     432 B/op    9 allocs/op
+BenchmarkSetSmall-12     19284    62728 ns/op     440 B/op    9 allocs/op
+BenchmarkSetMedium-12    19284    61708 ns/op     440 B/op    9 allocs/op
+BenchmarkSetLarge-12     13347    88996 ns/op     440 B/op    9 allocs/op
+BenchmarkGetSmall-12     19680    61881 ns/op     577 B/op    9 allocs/op
+BenchmarkGetMedium-12    18968    64686 ns/op    1446 B/op    9 allocs/op
+BenchmarkGetLarge-12     16568    76551 ns/op   10936 B/op    9 allocs/op
+BenchmarkHasher-12    22224796       51 ns/op      16 B/op    1 allocs/op
 ```
 
 ## Missing Feature
@@ -208,17 +94,17 @@ Right now we use a single per-connection mutex and don't support pipe-lining any
 operations. There is however support for connection pools which should make up
 for it.
 
-## Get involved!
+## Get involved
 
 We are happy to receive bug reports, fixes, documentation enhancements,
 and other improvements.
 
 Please report bugs via the
-[github issue tracker](http://github.com/memcachier/mc/issues).
+[github issue tracker](http://github.com/Morditux/mc/issues).
 
-Master [git repository](http://github.com/memcachier/mc):
+Master [git repository](http://github.com/Morditux/mc):
 
-- `git clone git://github.com/memcachier/mc.git`
+- `git clone git://github.com/Morditux/mc.git`
 
 ## Licensing
 
@@ -226,5 +112,11 @@ This library is MIT-licensed.
 
 ## Authors
 
-This library is written and maintained by MemCachier.
+New authors:
+
+- [Morditux](https://github.com/Morditux) (current maintainer)
+
+---
+
+This is a fork of [mc](https://github.com/memcachier/mc) by MemCachier.
 It was originally written by [Blake Mizerany](https://github.com/bmizerany/mc).

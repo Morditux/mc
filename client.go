@@ -109,7 +109,6 @@ func (c *Client) perform(m *msg) error {
 		}
 		return err
 	}
-	return nil
 }
 
 func (c *Client) wakeUp(s *server) {

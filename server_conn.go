@@ -9,8 +9,46 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
+
+// Tiered buffer pools for different body sizes to reduce allocations.
+// Bodies smaller than or equal to the tier size use that pool.
+// Bodies larger than 64KB are allocated directly (not pooled).
+var (
+	smallBodyPool  = sync.Pool{New: func() interface{} { return make([]byte, 256) }}
+	mediumBodyPool = sync.Pool{New: func() interface{} { return make([]byte, 4096) }}
+	largeBodyPool  = sync.Pool{New: func() interface{} { return make([]byte, 65536) }}
+)
+
+// getBodyBuffer returns a buffer of at least the requested size from the appropriate pool.
+func getBodyBuffer(size int) []byte {
+	switch {
+	case size <= 256:
+		return smallBodyPool.Get().([]byte)[:size]
+	case size <= 4096:
+		return mediumBodyPool.Get().([]byte)[:size]
+	case size <= 65536:
+		return largeBodyPool.Get().([]byte)[:size]
+	default:
+		return make([]byte, size) // Large bodies allocated directly
+	}
+}
+
+// putBodyBuffer returns a buffer to the appropriate pool based on its capacity.
+func putBodyBuffer(buf []byte) {
+	c := cap(buf)
+	switch {
+	case c == 256:
+		smallBodyPool.Put(buf[:c])
+	case c == 4096:
+		mediumBodyPool.Put(buf[:c])
+	case c == 65536:
+		largeBodyPool.Put(buf[:c])
+		// Large buffers not returned to pool
+	}
+}
 
 type mcConn interface {
 	perform(m *msg) error
@@ -128,7 +166,7 @@ func (sc *serverConn) auth() error {
 	}
 
 	switch {
-	case strings.Index(s, "PLAIN") != -1:
+	case strings.Contains(s, "PLAIN"):
 		return sc.authPlain()
 	}
 
@@ -198,7 +236,6 @@ func (sc *serverConn) sendRecvStats(m *msg) (stats McStats, err error) {
 		}
 		stats[m.key] = m.val
 	}
-	return
 }
 
 // send sends a request to the memcache server.
@@ -295,11 +332,10 @@ func (sc *serverConn) recv(m *msg) error {
 	m.header.CAS = binary.BigEndian.Uint64(sc.hdrBuf[16:])
 
 	// Read Body
-	// We allocation a new buffer for the body to avoid reading into a shared one
-	// and then copying again to string.
-	// Optimization: If BodyLen is small, maybe we can use stack, but Body can be large.
-	// For now, simple allocation is safer than complex pooling logic for variable sizes.
-	body := make([]byte, m.BodyLen)
+	// Use pooled buffer for the body. Since we convert to string (which copies),
+	// we can safely return the buffer to the pool after.
+	body := getBodyBuffer(int(m.BodyLen))
+	defer putBodyBuffer(body)
 	if _, err := io.ReadFull(sc.rw, body); err != nil {
 		return wrapError(StatusNetworkError, err)
 	}
@@ -401,23 +437,22 @@ func (sc *serverConn) backup(m *msg) {
 func backupMsg(m *msg, backupMsg *msg) {
 	backupMsg.key = m.key
 	backupMsg.val = m.val
-	backupMsg.header.Magic = m.header.Magic
-	backupMsg.header.Op = m.header.Op
-	backupMsg.header.KeyLen = m.header.KeyLen
-	backupMsg.header.ExtraLen = m.header.ExtraLen
-	backupMsg.header.DataType = m.header.DataType
-	backupMsg.header.ResvOrStatus = m.header.ResvOrStatus
-	backupMsg.header.BodyLen = m.header.BodyLen
-	backupMsg.header.Opaque = m.header.Opaque
-	backupMsg.header.CAS = m.header.CAS
-	backupMsg.iextras = nil // go way of clearing a slice, this is just fucked up
-	for _, v := range m.iextras {
-		backupMsg.iextras = append(backupMsg.iextras, v)
+	backupMsg.header = m.header // Copy entire struct at once
+
+	// Reuse slice capacity if possible to avoid allocation
+	if cap(backupMsg.iextras) >= len(m.iextras) {
+		backupMsg.iextras = backupMsg.iextras[:len(m.iextras)]
+	} else {
+		backupMsg.iextras = make([]interface{}, len(m.iextras))
 	}
-	backupMsg.oextras = nil
-	for _, v := range m.oextras {
-		backupMsg.oextras = append(backupMsg.oextras, v)
+	copy(backupMsg.iextras, m.iextras)
+
+	if cap(backupMsg.oextras) >= len(m.oextras) {
+		backupMsg.oextras = backupMsg.oextras[:len(m.oextras)]
+	} else {
+		backupMsg.oextras = make([]interface{}, len(m.oextras))
 	}
+	copy(backupMsg.oextras, m.oextras)
 }
 
 func (sc *serverConn) restore(m *msg) {
@@ -427,21 +462,20 @@ func (sc *serverConn) restore(m *msg) {
 func restoreMsg(m *msg, backupMsg *msg) {
 	m.key = backupMsg.key
 	m.val = backupMsg.val
-	m.header.Magic = backupMsg.header.Magic
-	m.header.Op = backupMsg.header.Op
-	m.header.KeyLen = backupMsg.header.KeyLen
-	m.header.ExtraLen = backupMsg.header.ExtraLen
-	m.header.DataType = backupMsg.header.DataType
-	m.header.ResvOrStatus = backupMsg.header.ResvOrStatus
-	m.header.BodyLen = backupMsg.header.BodyLen
-	m.header.Opaque = backupMsg.header.Opaque
-	m.header.CAS = backupMsg.header.CAS
-	m.iextras = nil // go way of clearing a slice, this is just fucked up
-	for _, v := range backupMsg.iextras {
-		m.iextras = append(m.iextras, v)
+	m.header = backupMsg.header // Copy entire struct at once
+
+	// Reuse slice capacity if possible to avoid allocation
+	if cap(m.iextras) >= len(backupMsg.iextras) {
+		m.iextras = m.iextras[:len(backupMsg.iextras)]
+	} else {
+		m.iextras = make([]interface{}, len(backupMsg.iextras))
 	}
-	m.oextras = nil
-	for _, v := range backupMsg.oextras {
-		m.oextras = append(m.oextras, v)
+	copy(m.iextras, backupMsg.iextras)
+
+	if cap(m.oextras) >= len(backupMsg.oextras) {
+		m.oextras = m.oextras[:len(backupMsg.oextras)]
+	} else {
+		m.oextras = make([]interface{}, len(backupMsg.oextras))
 	}
+	copy(m.oextras, backupMsg.oextras)
 }
